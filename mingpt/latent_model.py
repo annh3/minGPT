@@ -265,49 +265,72 @@ class LatentGPT(nn.Module):
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
+    
+    def embed_tokens(self, idx, start_pos=0):
+        """Token + position embeddings for tokens that start at position start_pos."""
+        t = idx.size(1)
+        pos = torch.arange(start_pos, start_pos + t, dtype=torch.long, device=idx.device)
+        return self.transformer.wte(idx) + self.transformer.wpe(pos)
 
-    def generate_once(self, inputs, targets=None):
-        """Transform a sequence of token or latent embeddings into hidden states."""
-        x = self.transformer.drop(inputs)
+    def forward_embeds(self, x):
+        """Your generate_once: (B, T, d) input embeddings -> (B, T, d) hidden states."""
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         return self.transformer.ln_f(x)
 
+    def add_latents(self, x, n_latents):
+        """Append n_latents continuous thoughts to x. Each thought is the last hidden state, fed back in."""
+        for _ in range(n_latents):
+            h = self.forward_embeds(x)
+            pos = torch.tensor([x.size(1)], device=x.device)
+            latent = h[:, -1:, :] + self.transformer.wpe(pos)   # the latent needs a position too
+            x = torch.cat([x, latent], dim=1)                   # no .detach(): gradients flow through the chain
+        return x
+
+    def forward(self, q_idx, a_idx=None, n_latents=0):
+        """
+        q_idx: (B, Tq) question tokens
+        a_idx: (B, Ta) answer tokens (training); use -1 for padding
+        """
+        x = self.embed_tokens(q_idx)
+        x = self.add_latents(x, n_latents)
+        answer_start = x.size(1)
+        if a_idx is not None:
+            x = torch.cat([x, self.embed_tokens(a_idx.clamp(min=0), start_pos=answer_start)], dim=1)
+        assert x.size(1) <= self.block_size, "question + latents + answer exceeds block_size"
+
+        h = self.forward_embeds(x)
+        logits = self.lm_head(h)
+
+        loss = None
+        if a_idx is not None:
+            B, T = x.shape[:2]
+            # minGPT convention: targets[i] is the token that should follow position i
+            targets = torch.full((B, T), -1, dtype=torch.long, device=x.device)
+            targets[:, answer_start - 1 : T - 1] = a_idx   # last latent predicts answer[0]
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        return logits, loss
+
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        if temperature <= 0:
-            raise ValueError("temperature must be greater than 0")
+    def generate(self, q_idx, n_latents, max_new_tokens, temperature=1.0,
+                do_sample=False, top_k=None):
+        # Think once: question + latents
+        x = self.embed_tokens(q_idx)
+        x = self.add_latents(x, n_latents)
 
-        b, t = idx.size()
-        assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        device = idx.device
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
-
-        start_emb = tok_emb + pos_emb
-        sequence = start_emb
-        generated_states = []
-
+        # Then decode tokens autoregressively on top of that prefix
+        out = []
         for _ in range(max_new_tokens):
-            context = sequence[:, -self.block_size:]
-            hidden = self.generate_once(context)[:, -1:, :]
-            generated_states.append(hidden)
-            sequence = torch.cat((context, hidden), dim=1)
-
-        if not generated_states:
-            return idx
-
-        logits = self.lm_head(torch.cat(generated_states, dim=1)) / temperature
-        probs = F.softmax(logits, dim=-1)
-        next_tokens = torch.argmax(probs, dim=-1)
-
-        idx = torch.cat((idx, next_tokens), dim=1)
-        return idx
+            if x.size(1) >= self.block_size:
+                break
+            h = self.forward_embeds(x)
+            logits = self.lm_head(h[:, -1, :]) / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, 1) if do_sample else probs.argmax(-1, keepdim=True)
+            out.append(idx_next)
+            x = torch.cat([x, self.embed_tokens(idx_next, start_pos=x.size(1))], dim=1)
+        return torch.cat(out, dim=1)   # answer tokens only; the latents have no token IDs

@@ -25,6 +25,10 @@ def parse_args():
         help="Pretrained GPT-2 checkpoint to initialize LatentGPT (default: gpt2).",
     )
     parser.add_argument(
+        "--n_latents", type=int, default=0,
+        help="Number of latents",
+    )
+    parser.add_argument(
         "--max-new-tokens", type=int, default=80,
         help="Number of latent steps to decode for each prompt (default: 80).",
     )
@@ -81,6 +85,7 @@ def main():
                 idx,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
+                n_latents=args.n_latents,
             )
         print(encoder.decode(output_ids[0].tolist()))
 
