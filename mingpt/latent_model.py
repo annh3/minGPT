@@ -266,7 +266,7 @@ class LatentGPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, inputs):
+    def generate_once(self, inputs, targets=None):
         """Transform a sequence of token or latent embeddings into hidden states."""
         x = self.transformer.drop(inputs)
         for block in self.transformer.h:
@@ -274,7 +274,7 @@ class LatentGPT(nn.Module):
         return self.transformer.ln_f(x)
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -282,8 +282,6 @@ class LatentGPT(nn.Module):
         """
         if temperature <= 0:
             raise ValueError("temperature must be greater than 0")
-        if top_k is not None and top_k < 1:
-            raise ValueError("top_k must be at least 1")
 
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -300,7 +298,7 @@ class LatentGPT(nn.Module):
 
         for _ in range(max_new_tokens):
             context = sequence[:, -self.block_size:]
-            hidden = self.forward(context)[:, -1:, :]
+            hidden = self.generate_once(context)[:, -1:, :]
             generated_states.append(hidden)
             sequence = torch.cat((context, hidden), dim=1)
 
@@ -308,16 +306,8 @@ class LatentGPT(nn.Module):
             return idx
 
         logits = self.lm_head(torch.cat(generated_states, dim=1)) / temperature
-        if top_k is not None:
-            k = min(top_k, logits.size(-1))
-            values, _ = torch.topk(logits, k, dim=-1)
-            logits[logits < values[..., -1, None]] = -float('Inf')
         probs = F.softmax(logits, dim=-1)
-        if do_sample:
-            next_tokens = torch.multinomial(probs.reshape(-1, probs.size(-1)), num_samples=1)
-            next_tokens = next_tokens.view(b, -1)
-        else:
-            next_tokens = torch.argmax(probs, dim=-1)
+        next_tokens = torch.argmax(probs, dim=-1)
 
         idx = torch.cat((idx, next_tokens), dim=1)
         return idx

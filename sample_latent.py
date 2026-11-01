@@ -81,8 +81,6 @@ def main():
                 idx,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
-                do_sample=not args.greedy,
-                top_k=top_k,
             )
         print(encoder.decode(output_ids[0].tolist()))
 
