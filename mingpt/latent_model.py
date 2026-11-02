@@ -286,6 +286,7 @@ class LatentGPT(nn.Module):
             pos = torch.tensor([x.size(1)], device=x.device)
             latent = h[:, -1:, :] + self.transformer.wpe(pos)   # the latent needs a position too
             x = torch.cat([x, latent], dim=1)                   # no .detach(): gradients flow through the chain
+        # x = [emb(x), h1, h2,..., hn]
         return x
 
     def forward(self, q_idx, a_idx=None, n_latents=0):
@@ -295,9 +296,12 @@ class LatentGPT(nn.Module):
         """
         x = self.embed_tokens(q_idx)
         x = self.add_latents(x, n_latents)
+
         answer_start = x.size(1)
+        # for COCONUT style reasoning, index into a_idx[n_latents:]
+
         if a_idx is not None:
-            x = torch.cat([x, self.embed_tokens(a_idx.clamp(min=0), start_pos=answer_start)], dim=1)
+            x = torch.cat([x, self.embed_tokens(a_idx[:,n_latents:].clamp(min=0), start_pos=answer_start)], dim=1)
         assert x.size(1) <= self.block_size, "question + latents + answer exceeds block_size"
 
         h = self.forward_embeds(x)
@@ -308,7 +312,7 @@ class LatentGPT(nn.Module):
             B, T = x.shape[:2]
             # minGPT convention: targets[i] is the token that should follow position i
             targets = torch.full((B, T), -1, dtype=torch.long, device=x.device)
-            targets[:, answer_start - 1 : T - 1] = a_idx   # last latent predicts answer[0]
+            targets[:, answer_start - 1 : T - 1] = a_idx[:,n_latents:]   # last latent predicts answer[0]
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
 
